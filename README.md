@@ -1,2 +1,4 @@
 # data-vis-world-indicators
-The set of visualizations created for Data Visualization laboratories at PUT
+This is a reproducible data analysis in the form of Rmarkdown.
+
+Created for Data Visualization laboratories at PUT
