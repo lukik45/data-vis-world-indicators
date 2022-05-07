@@ -1,0 +1,581 @@
+---
+title: "World indicators analysis"
+author: "Łukasz Kosturski, Krystian Moras"
+date: "27 04 2022"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    theme: flatly
+  
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE )
+#knitr::opts_knit$set(root.dir=rprojroot::find_rstudio_root_file())
+set.seed(23)
+```
+```{r, echo=FALSE}
+htmltools::img(src = knitr::image_uri(file.path('./PP_logotyp_ANG_CMYK.svg')), 
+               alt = 'logo', 
+               style = 'position:absolute; top:0; right:0; padding:10px;',
+               height='auto', width='300')
+```
+
+```{r  imports}
+library(tidyverse)
+library(ggplot2)
+library(BBmisc)
+library("readxl")
+
+# ggplot extensions
+library(gganimate)
+library(ggbump)
+library(ggrepel)
+if(!require(ggflags)) devtools::install_github("rensa/ggflags")
+library(ggflags)
+library(plotly)
+
+
+library(countrycode)  # library to extract codes, continents from country names
+library(maps) # coordinates for the world map
+
+library(RColorBrewer)
+library(paletteer)
+
+library("eurostat") #European borders and country codes
+library("sf") # Simple features for plotting polygons
+
+library(grid)
+library(patchwork) 
+library(scatterpie) # distributed pie charts on the map
+```
+
+
+```{r}
+wdi <-  read_excel('../data/World_Development_Indicators.xlsx')
+oldnames <- colnames(wdi)
+newnames <- gsub(pattern = '..YR[0-9][0-9][0-9][0-9].', '', colnames(wdi))
+
+```
+
+
+```{r}
+indicators_base <- wdi %>%
+  rename_at(vars(oldnames), ~newnames) %>%
+  rename(series = "Series Name",country_name = "Country Name", country_code = "Country Code") %>%
+  filter(!country_name %in% c("Upper middle income","High income","Low & middle income","Low income","Middle income", "Data from database: World Development Indicators")) %>%
+  na_if("..")
+
+```
+
+---
+
+## GDP per capita analysis
+
+
+### Top countries
+
+This bump chart presents the ranking of countries with the highest GDP in years 2000 - 2020.
+We chose 10 countries with the highest mean rank within the given time interval.
+
+
+
+```{r  GDP_bump_data}
+GDP <- indicators_base %>%
+  filter( series == "GDP per capita (current US$)")%>%
+  filter(if_all('2000':'2020', ~ !is.na(.))) %>%
+  select(country_name, '2000':'2020') %>%
+  filter(country_name != "World") %>%
+  # single row - single observation  - using tidyr
+  pivot_longer(cols = 2:22, names_to= 'year', values_to = 'GDP_per_capita') %>%
+  # transform datatypes
+  transform(GDP_per_capita = as.numeric(GDP_per_capita)) %>%
+  transform(year = as.numeric(year)) %>%
+  # ranking
+  group_by(year) %>%
+  mutate(rank = rank(-GDP_per_capita, ties.method = "random")) %>%
+  ungroup() %>%
+  # mean rank
+  group_by(country_name) %>%
+  mutate(mean_rank = mean(rank)) %>%
+  ungroup() 
+  # take the best 10 countries over all years
+  GDP <- GDP%>%
+    filter(country_name %in% 
+             (GDP %>% distinct(country_name, mean_rank) %>%
+                top_n(10, -mean_rank) %>%
+                pull(country_name)))
+  
+  GDP <- GDP %>%
+    # rereank
+    group_by(year) %>%
+    mutate(rank = rank(-GDP_per_capita, ties.method = "random")) %>%
+    ungroup() %>%
+    select(-mean_rank)
+  
+```
+
+```{r}
+# code to get codes of the countries (to utilize geom_flag())
+
+country_2_letters <- countrycode(
+  GDP$country_name %>% 
+    unique() %>% 
+    sort(), 
+  origin = "country.name", destination = "genc2c") %>%
+  tolower() %>%
+  set_names(GDP$country_name %>% unique() %>% sort())
+
+GDP <- GDP %>%
+  mutate(country_code = country_2_letters[country_name])
+```
+
+```{r GDP_bum_chart_plot}
+GDP_plot <-   
+  ggplot(data=GDP, aes(year, rank, group=country_name, color= country_name,  
+            fill= country_name)) +
+  geom_bump(smooth=10, size=1.5, lineend= "round", alpha=.8) +
+  geom_flag(data = GDP %>% filter(year==min(year)), aes(country=country_code), 
+            size=8, color="black") +
+  geom_flag(data = GDP %>% filter(year==max(year)), aes(country=country_code), 
+            size=8) +
+  scale_color_paletteer_d("tidyquant::tq_light") +
+  
+  # label for each contry
+  geom_text(data = GDP %>% filter(year == max(year)),
+            aes(label = country_name),
+            color = "gray16",
+            nudge_x = .51,
+            hjust = 0,
+            size = 3,
+            fontface = 2) +
+  xlim(c(2000, 2022)) +
+  scale_y_reverse(breaks= 1:10) +
+  theme_classic() +
+  theme(legend.position = "none",
+        ) +
+  labs(x = NULL,
+       y = NULL,
+       title = "GDP per capita ranking",
+       subtitle = "For 10 countries that were ranked the highest in 2000-2020")
+
+```
+```{r fig.height= 5, fig.width= 8}
+GDP_plot
+```
+Luxembourg comes top each year, we can also see the gradual rise of Ireland.
+
+
+### The correlation between active youth and GDP
+
+> The evaluation is for Europe only.
+
+
+```{r}
+indicators_eu <- indicators_base %>%
+  mutate(
+continent_name = countrycode(
+  sourcevar = indicators_base$country_name,
+  origin = "country.name",
+  destination = "continent")) %>%
+  dplyr::relocate(continent_name, .after=country_name) %>%
+  dplyr::filter(continent_name == "Europe")
+```
+```{r youth_GDP_data}
+reason_s= "Share of youth not in education, employment or training, total (% of youth population)"
+
+
+youth_GDP_eu <- indicators_eu %>%
+  filter(series %in% c(reason_s, "GDP per capita (current US$)")) %>%
+  select(country_name, series,  "1970": "2020")%>%
+  pivot_longer(cols = "1970":"2020", names_to = "year", values_to = "value") %>%
+  pivot_wider(names_from = series, values_from = value) %>%
+  rename(reason_val= reason_s , GDP_p_c = "GDP per capita (current US$)") %>%
+  mutate(year = as.integer(year), 
+  reason_val = as.double(reason_val),
+  GDP_p_c = as.numeric(GDP_p_c))
+
+```
+```{r}
+youth_GDP_eu_2017 <- youth_GDP_eu %>%
+  filter(year == 2017) %>%
+  filter(country_name != "Russian Federation") %>%
+  drop_na(reason_val, GDP_p_c)
+```
+
+```{r  }
+youth_GDP_plot <- ggplot(data= youth_GDP_eu_2017, aes(x= reason_val, y = GDP_p_c, label=country_name)) +
+  #geom_point( size= 0, alpha= .6) +
+  geom_label_repel(seed = 23, size = 3, max.overlaps = 8, segment.color= "grey30",
+                   fontface= "bold", 
+                   fill = ifelse(youth_GDP_eu_2017$country_name == "Italy","#E31A1C" ,"#18BC9C"), color = "white") +  # color from cb set 3 
+  theme_minimal() + 
+  labs(title = "Influence of youth not taking education on GDP per capita",
+       subtitle = "Chosen European countries",
+       caption = "Data from 2017") +
+  xlab("% of lazy youth") +
+  ylab("GDP per capita")
+  
+
+youth_GDP_plot
+```
+
+The chart illustrates a strong correlation between the share of youth not in education, employment or training and the GDP per capita. 
+It also shows one deviation - Italy (marked red) has relatively high GDP/capita considering how many young people from this country do not take up any education or work.
+
+
+
+### Rural population change
+
+The following map illustrates the change of people living in cities in years 1970-2020.
+
+On the next visualization we will see how the urbanization is correlated with GDP per capita.
+
+
+```{r  world_map_data}
+world <- map_data("world")
+feature_map <- "Urban population (% of total population)"
+
+data_map <- indicators_base %>%
+  filter(series == feature_map  ) %>%
+  filter(country_name != "World") %>%
+  select(country_name, country_code, 
+         '1970', '1980', '1990', '2000', '2010', '2020') %>%
+    # single row - single observation  - using tidyr
+  pivot_longer(cols = 3:8, names_to= 'year', values_to = 'feature_val') %>%
+  # transform datatypes
+  mutate(feature_val = as.numeric(feature_val), 
+         year = as.numeric(year)) %>%
+  
+  mutate(country_name = recode(str_trim(country_name), 
+        "United States" = "USA",
+        "United Kingdom" = "UK",
+        "Russian Federation"  = "Russia",
+        "Korea, Dem. People's Rep." = "South Korea",
+        "Congo Dem. Rep." = "Democratic Republic of the Congo" ,
+        "Congo Rep." = "Republic of Congo",
+        "Egypt, Arab Rep." = "Egypt"))
+  
+```
+```{r}
+# merging the datasets (polygons and values)
+data_map <- inner_join(world, data_map, by= c("region" = "country_name"), keep= TRUE)
+```
+```{r}
+## Removing unnecessary elements
+plain <- theme(
+  axis.text = element_blank(),
+  axis.line = element_blank(),
+  axis.ticks = element_blank(),
+  panel.border = element_blank(),
+  panel.grid = element_blank(),
+  axis.title = element_blank(),
+  panel.background = element_rect(fill = "white"),
+  plot.title = element_text(hjust = 0.5),
+)
+
+
+world_map_static <- 
+  ggplot(data = data_map, aes(x=long, y=lat, group=group)) +
+  coord_fixed(1.3) +
+  geom_polygon(aes(fill = feature_val)) +
+  scale_fill_distiller(type= "seq", palette = 14, direction = 1, na.value="grey33", values = c(0,1), ) +
+  plain +
+  labs(fill="Urbanization (%)")
+  
+
+# world_map_static
+```
+
+```{r map_animation}
+# animation
+anim_pop <- world_map_static + transition_time(year, ) +
+  ggtitle("Urban population (% of total population)",
+          subtitle ='Year: {frame_time}')
+
+num_years <- 6
+gif_anim <- animate(anim_pop, nframes = num_years, fps = 0.8)
+
+```
+```{r showing_map_gif}
+gif_anim
+```
+
+
+### Urbanization's influence on GDP
+On the chart we can see the correlation between the urbanization level and the GDP per capita.
+We also show the percentage of population that reaches the age of 65 as a feature that is strongly related with GDP per capita.
+
+***GDP per capita for each country is represented by the size of a bubble.***
+
+
+```{r}
+feature_x <- "Employers, total (% of total employment) (modeled ILO estimate)"
+feature_y <- "Survival to age 65, male (% of cohort)"
+feature_z <- "GDP per capita (current US$)"
+
+feature_x <- "Urban population (% of total population)"
+
+
+data_buble <- indicators_base %>%
+  mutate(continent_name = countrycode(
+    sourcevar = indicators_base$country_name,
+    origin = "country.name",
+    destination = "continent")) %>%
+  filter(series %in% c(feature_x, feature_y, feature_z)) %>%
+  select(country_name, continent_name, series, "1970":"2020") %>%
+  pivot_longer(cols = "1970":"2020", names_to = "year", values_to= "value") %>%
+  pivot_wider(names_from = series, values_from = value) %>%
+  rename(feature_x_val = feature_x, feature_y_val = feature_y, feature_z_val = feature_z) %>%
+  mutate(year = as.integer(year), 
+         feature_x_val = as.numeric(feature_x_val),
+         feature_y_val = as.numeric(feature_y_val),
+         feature_z_val = as.numeric(feature_z_val))
+
+```
+```{r}
+data_bubble_2017 <- data_buble %>%
+  filter(year == 2017) %>%
+  drop_na()
+```
+```{r}
+bubble_chart <- ggplot(data = data_bubble_2017, mapping = aes(x = feature_x_val, y = feature_y_val)) +
+  geom_point(aes(size = feature_z_val, color = continent_name, text = paste0(country_name,"\n", "GDP p.c.:", round(feature_z_val))), alpha = .67, ) +
+  #scale_color_brewer(palette = "") +
+  #scale_colour_paletteer_d("ggsci::category10_d3" ) +
+  scale_color_paletteer_d("tidyquant::tq_light", ) +
+  
+  theme_minimal() +
+  labs( 
+       caption = "Data from 2017",
+       color= "Continent") +
+  xlab("Urban population (% of total population)") +
+  ylab("Survival to age 65, male (% of cohort)") + 
+  guides(size = FALSE)
+
+
+
+ggplotly(bubble_chart, tooltip = c("text", "group"))
+```
+
+We can clearly see that for African countries the urbanization ratio is lower than  for the rest of the world.
+Both indicators seem to be strongly correlated with the GDP per capita.
+
+In top-right corner
+
+
+
+---
+## Greenhouse gas emissions analysis
+
+### Top emitters
+
+This animation presents the largest greenhouse gas emitters in years 1970-2020.
+
+```{r}
+wdi_cleaned <- wdi %>% 
+  rename_at(vars(oldnames), ~ newnames)
+greenhouse <- wdi_cleaned %>% 
+  filter(`Series Name` == "Total greenhouse gas emissions (kt of CO2 equivalent)") %>%
+  filter(!`Country Name` %in% c("World","Upper middle income","High income","Low & middle income","Low income","Middle income","Lower middle income")) %>%
+  mutate(`Country Code` = countrycode::countrycode(`Country Code`, "iso3c","iso2c")) %>%  #%>% 
+  select(`Country Name`,`Country Code`,`1970`:`2020`) %>%
+  gather(year,value,`1970`: `2020`) %>%
+  mutate(value=replace(value,value=='..',0)) %>%
+  transform(value=as.numeric(value)) %>%
+  mutate(`Country Name`= `Country.Name`) %>% select(!`Country.Name`) %>%
+  group_by(year) %>%
+  mutate(rank = rank(-value),
+         Value_lbl = paste0(" ",round(value))) %>%
+  filter(rank <=10) %>% mutate(year = as.numeric(year))
+greenhouse$Country.Code = tolower(greenhouse$Country.Code)
+```
+```{r}
+staticplot = ggplot(data=greenhouse,aes(rank,value, group=`Country Name`, color= `Country Name`,  fill= `Country Name`)) +
+  geom_col(aes(x = rank, y = value), fill = "azure3", color = "black") + # Columns
+  theme_classic() +
+  theme(legend.position = "none",axis.text.y  = element_blank()
+        ,plot.margin = margin(0,2,0,3,"cm")) +
+  geom_text(aes(label = `Country Name`,x = rank,
+            y = -200),
+            color = "gray16",hjust=1) +
+  coord_flip(clip = "off", expand = FALSE) + # Flip
+  geom_flag(aes(x = rank, y =value,  country = `Country.Code`), size = 10) + # Flags
+  scale_y_continuous(labels = scales::comma) + # Format y-axis values
+  scale_x_reverse() + # Highest values on top
+  transition_states(year, transition_length = 4, state_length = 1) + # Animate
+  scale_color_paletteer_d("tidyquant::tq_light") +
+  labs(x = "", y = "kt of CO2",title = "Biggest greenhouse gas emitters (kt of CO2 equivalent)",subtitle= "years 1970-2020") # object `year` not found
+        
+```
+
+```{r}
+staticplot
+```
+Animation shows that before 2000`s the biggest emitters were USA and Russia, with China taking a huge lead after. Over time European countries slowly decline their emissions whilst developing and manufacturing focused countries increased them.
+
+### Carbon emissions by fuel state of matter in EU
+
+We differentiate three types:
+
+- solid : anthracite, coal, long lasting ovals, coke
+
+
+- liquid : petroleum based fuels, natural gas liquids, biofuels
+
+
+- gas :  LNG, natural gas, producer gas, coal gas
+
+The animation presents changes in EU member states' fuel type use in years 1992-2015
+
+```{r}
+
+#prepare emissions by type
+#note years (1992-2015) chosen for data integrity
+gas_emissions <- wdi_cleaned %>%
+  filter(`Series Name` == "CO2 emissions from gaseous fuel consumption (kt)") %>%
+  gather(year,gas,`1992`:`2015`) %>%
+  select(`Country Name`,`Country Code`, `year`,`gas`) %>%
+  mutate(gas=as.numeric(replace(gas,gas=='..',0)))
+liquid_emissions <- wdi_cleaned %>%
+  filter(`Series Name` == "CO2 emissions from liquid fuel consumption (kt)") %>%
+  gather(year,liquid,`1992`:`2015`) %>%
+  select(`Country Name`,`Country Code`, `year`,`liquid`) %>%
+  mutate(liquid=as.numeric(replace(liquid,liquid=='..',0)))
+solid_emissions <- wdi_cleaned %>%
+  filter(`Series Name` == "CO2 emissions from solid fuel consumption (kt)") %>%
+  gather(year,solid,`1992`:`2015`) %>%
+  select(`Country Name`,`Country Code`, `year`,`solid`) %>%
+  mutate(solid=as.numeric(replace(solid,solid=='..',0)))
+
+
+#join into one data frame
+all_emissions <- left_join(gas_emissions,liquid_emissions,by=c('Country Name','Country Code','year')) %>%
+  left_join(.,solid_emissions,by=c('Country Name', 'Country Code','year')) %>%
+  mutate(sum=100-rowSums(across(gas:solid))) 
+```
+
+```{r}
+
+
+
+#load EU countries` borders
+get_eurostat_geospatial(resolution = 10, 
+                        nuts_level = 0, 
+                        year = 2016)
+SHP_0 <- get_eurostat_geospatial(resolution = 10, 
+                                 nuts_level = 0, 
+                                 year = 2021)
+EU27 <- eu_countries %>% 
+  filter(code != 'UK') %>% 
+  select(geo = code, name)
+SHP_27 <- SHP_0 %>% 
+  select(geo = NUTS_ID, geometry) %>% 
+  inner_join(EU27, by = "geo") %>% 
+  arrange(geo) %>% 
+  st_as_sf()
+
+# move into one iso2c format -> used in eurostat
+all_emissions_cleaned <- all_emissions %>% mutate(`Country Code` = countrycode::countrycode(`Country Code`, "iso3c","iso2c"))
+europe_emmissions <- all_emissions_cleaned %>%filter(`Country Code` %in% SHP_27$geo)
+# join geospatial data with emissions
+europe_emmissions_geo <- left_join(europe_emmissions,SHP_27,by=c("Country Code" = "geo"))
+
+# calculate geographical midpoints of countries
+centroids <- europe_emmissions_geo$geometry %>% st_centroid() %>% 
+  # this is the crs from d, which has no EPSG code:
+  st_transform(., '+proj=longlat +ellps=GRS80 +no_defs') %>%
+  # since you want the centroids in a second geometry col:
+  st_geometry() %>% st_as_sf() %>% transform(country = europe_emmissions_geo$`Country Name`) %>%
+  mutate(x=replace(x,country=="France",st_point(c(2,46)))) %>% #France borders include overseas territories
+  mutate(x=replace(x,country=="Czech Republic",st_point(c(15.1,49.9)))) %>% # correct error in calculation
+  mutate(x=replace(x,country=="Slovak Republic",st_point(c(19.78,48.7)))) # correct error in calculation
+
+#adjust data type to fit the scatterpie requirements
+lats = c()
+longs = c()
+for (center in centroids$x) {
+  lats <- rbind(lats,st_bbox(center)$xmin)
+  longs <- rbind(longs,st_bbox(center)$ymin)
+}
+
+lats[is.na(lats)] <- 0
+longs[is.na(longs)] <- 0
+europe_emissions_lat_long <- europe_emmissions_geo %>% select(`Country Name`,year,gas,liquid,solid,geometry) %>% transform(lats =as.numeric(lats)) %>% transform(longs=as.numeric(longs))
+
+# necessary to generate and save plots for each year 
+# using gganimate throws errors when trying to animate both polygons and pie charts
+for (yr in europe_emissions_lat_long$year %>% unique()) {
+  emissions_for_year <- europe_emissions_lat_long %>% filter(year==yr)
+  plot <- ggplot(emissions_for_year)+ggtitle(paste("Carbon emissions by type of fuel\n year:",yr)) + geom_sf(aes(geometry=geometry)) +
+  scale_x_continuous(limits =c(-10, 35)) +
+  scale_y_continuous(limits = c(33, 68)) + theme_void() +geom_scatterpie(aes(x=lats,y=longs,r=0.85),data=emissions_for_year,cols=c("gas","solid","liquid"))
+  print(plot)
+  ggsave(paste(trimws(yr),"plot.png",sep=''),bg="#FFFFFF")
+  dev.off()
+}
+
+# create a gif from generated images
+library(gifski)
+png_files <- list.files(".", pattern = ".*png$", full.names = TRUE)
+#png_files
+animation <- gifski(png_files, gif_file = "animation.gif", width = 1600, height = 1200, delay = 0.5)
+#animation
+
+
+```
+![alt text](animation.gif "Carbon emissions")
+For 20 years, most EU countries did not change their sources of fuel by a large margin. The most noticeable are Baltic States which increased their reliance on gas from liquid fuels, Poland`s solid fuel use slowly declining and Luxembourg cutting down solid fuels completely.
+
+### Manufacturing vs emissions vs GDP per capita
+
+The following bubble chart shows correlations between three indicators % of manufacturing in economy, greenhouse gas emissions and GDP per capita
+
+```{r}
+feature_x <- "GDP per capita (current US$)"
+feature_z <- "Total greenhouse gas emissions (kt of CO2 equivalent)"
+feature_y <- "Manufacturing, value added (% of GDP)"
+
+
+
+emissions <- wdi_cleaned %>%
+  mutate(continent_name = countrycode(
+    sourcevar = wdi_cleaned$`Country Name`,
+    origin = "country.name",
+    destination = "continent")) %>%
+  filter(`Series Name` %in% c(feature_x, feature_y, feature_z)) %>%
+  select(`Country Name`, continent_name, `Series Name`, "1970":"2020") %>%
+  pivot_longer(cols = "1970":"2020", names_to = "year", values_to= "value") %>%
+  pivot_wider(names_from = `Series Name`, values_from = value) %>%
+  rename(feature_x_val = feature_x, feature_y_val = feature_y, feature_z_val = feature_z) %>%
+  mutate(year = as.integer(year), 
+         feature_x_val = as.numeric(feature_x_val),
+         feature_y_val = as.numeric(feature_y_val),
+         feature_z_val = as.numeric(feature_z_val))
+
+emissions_2015 <- emissions %>%
+  filter(year == 2015) %>%
+  drop_na()
+
+bubble_chart <- ggplot(data = emissions_2015, mapping = aes(x = feature_x_val, y = feature_y_val)) +
+  geom_point(aes(size = feature_z_val, color = continent_name, text = paste0(`Country Name`,"\n", "kt of CO2: ", round(feature_z_val))), alpha = .67, ) +
+  scale_color_paletteer_d("tidyquant::tq_light", ) +
+  
+  theme_minimal() +
+  labs( 
+       caption = "Data from 2015",
+       color= "Continent") +
+  xlab("GDP per capita (current US$)") +
+  ylab("Manufacturing, value added (% of GDP)") + 
+  guides(size = FALSE)
+
+
+
+ggplotly(bubble_chart, tooltip = c("text", "group"))
+```
+In general we can observe that higher % of manufacturing in economy, loosely correlate with higher greenhouse gas emissions, presumably because of increased need for energy. One outlier - Ireland seems to defy that rule, however that is because of [Apple moving headquarters to Ireland](https://www.forbes.com/sites/timworstall/2016/09/08/absolutely-fascinating-apples-eu-tax-bill-explains-irelands-26-gdp-rise/) . We can also see that the richest countries with exception to USA do not produce a lot of emissions. One of the reasons why may be a type of products manufactured, [three largest companies in Europe belong to automotive industry](https://en.wikipedia.org/wiki/List_of_largest_European_manufacturing_companies_by_revenue)
+
