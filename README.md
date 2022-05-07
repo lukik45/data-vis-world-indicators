@@ -1,4 +1,9 @@
-# data-vis-world-indicators
-A reproducible data analysis in the form of Rmarkdown.
+# data-visualization
 
-Created for Data Visualization laboratories at PUT
+
+`lab3_analysis.html` 
+: A reproducible data analysis of some world development indicators in the form of Rmarkdown.
+
+
+
+###### Created for Data Visualization laboratories at PUT
